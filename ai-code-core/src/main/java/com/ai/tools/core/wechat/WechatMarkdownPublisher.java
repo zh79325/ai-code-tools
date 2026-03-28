@@ -18,6 +18,8 @@ import java.util.regex.Pattern;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.node.ArrayNode;
+import com.fasterxml.jackson.databind.node.ObjectNode;
 
 /**
  * 微信公众号Markdown文章发布工具
@@ -74,7 +76,8 @@ public class WechatMarkdownPublisher {
             String baseDir = getBaseDir(markdownFilePath);
 
             // 2. 提取并上传图片，替换链接
-            markdownContent = processImages(markdownContent, baseDir);
+            ImageUploadResult firstImageResult = processImagesAndUploadFirst(markdownContent, baseDir, getAccessToken());
+            markdownContent = firstImageResult.getProcessedMarkdown();
 
             // 3. Markdown转HTML
             String htmlContent = markdownToHtml(markdownContent);
@@ -82,8 +85,8 @@ public class WechatMarkdownPublisher {
             // 4. 获取access_token
             String accessToken = getAccessToken();
 
-            // 5. 创建草稿
-            String mediaId = createDraft(accessToken, title, htmlContent);
+            // 5. 创建草稿（需要thumb_media_id）
+            String mediaId = createDraft(accessToken, title, htmlContent, firstImageResult.getThumbMediaId());
 
             logger.info("草稿创建成功, mediaId: {}", mediaId);
             return new PublishResult(mediaId, title);
@@ -110,38 +113,87 @@ public class WechatMarkdownPublisher {
     }
 
     /**
-     * 处理图片：提取本地图片，上传，替换链接
+     * 处理图片：提取所有图片（本地+网络），全部上传，替换链接
+     * 同时使用第一张图片作为封面，返回thumbMediaId
      */
-    private String processImages(String markdown, String baseDir) throws IOException {
-        StringBuffer result = new StringBuffer();
+    private ImageUploadResult processImagesAndUploadFirst(String markdown, String baseDir, String accessToken) throws IOException {
+        StringBuilder result = new StringBuilder();
         Matcher matcher = IMAGE_PATTERN.matcher(markdown);
+        String thumbMediaId = null;
+        boolean firstImageProcessed = false;
+        int imageCount = 0;
 
         while (matcher.find()) {
             String imagePath = matcher.group(1).trim();
+            imageCount++;
 
-            // 判断是否是本地图片（不是http开头就是本地路径）
+            File imageFile;
+
+            // 判断是否是本地图片还是网络图片
             if (!imagePath.startsWith("http://") && !imagePath.startsWith("https://")) {
+                // 本地图片
                 String fullPath = resolveFullPath(imagePath, baseDir);
-                File imageFile = new File(fullPath);
-
-                if (imageFile.exists() && imageFile.isFile()) {
-                    logger.info("上传本地图片: {}", fullPath);
-                    String accessToken = getAccessToken();
-                    ImageResult imageResult = uploadImage(accessToken, imageFile);
-                    // 替换为微信URL
-                    matcher.appendReplacement(result, "![](" + imageResult.getUrl() + ")");
-                    logger.info("图片上传成功: {}", imageResult.getUrl());
-                } else {
+                imageFile = new File(fullPath);
+                if (!imageFile.exists() || !imageFile.isFile()) {
                     logger.warn("图片文件不存在: {}, 保持原链接", fullPath);
                     matcher.appendReplacement(result, "![](" + imagePath + ")");
+                    continue;
                 }
+                logger.info("上传本地图片 {}/{}: {}", imageCount, countImages(markdown), fullPath);
             } else {
-                // 网络图片保持不变
-                matcher.appendReplacement(result, "![](" + imagePath + ")");
+                // 网络图片，下载到临时文件
+                logger.info("下载并上传网络图片 {}/{}: {}", imageCount, countImages(markdown), imagePath);
+                imageFile = downloadImageToTempFile(imagePath);
+            }
+
+            // 上传图片到素材库
+            ImageResult imageResult = uploadImage(accessToken, imageFile);
+            // 替换为微信URL
+            matcher.appendReplacement(result, "![](" + imageResult.getUrl() + ")");
+            logger.info("图片上传成功: {}", imageResult.getUrl());
+
+            // 第一张图片作为封面
+            if (!firstImageProcessed) {
+                thumbMediaId = imageResult.getMediaId();
+                firstImageProcessed = true;
+                logger.info("封面图片设置完成, mediaId: {}", thumbMediaId);
+            }
+
+            // 如果是网络图片下载的临时文件，删除
+            if (imagePath.startsWith("http://") || imagePath.startsWith("https://")) {
+                imageFile.delete();
             }
         }
         matcher.appendTail(result);
-        return result.toString();
+        logger.info("图片处理完成，共上传 {} 张图片", imageCount);
+        return new ImageUploadResult(result.toString(), thumbMediaId);
+    }
+
+    /**
+     * 统计图片数量
+     */
+    private int countImages(String markdown) {
+        Matcher matcher = IMAGE_PATTERN.matcher(markdown);
+        int count = 0;
+        while (matcher.find()) {
+            count++;
+        }
+        return count;
+    }
+
+    /**
+     * 下载网络图片到临时文件
+     */
+    private File downloadImageToTempFile(String imageUrl) throws IOException {
+        File tempFile = File.createTempFile("wechat_cover", ".jpg");
+        Request request = new Request.Builder().url(imageUrl).build();
+        try (Response response = httpClient.newCall(request).execute()) {
+            if (!response.isSuccessful() || response.body() == null) {
+                throw new IOException("下载图片失败: " + imageUrl);
+            }
+            Files.write(tempFile.toPath(), response.body().bytes());
+            return tempFile;
+        }
     }
 
     /**
@@ -238,20 +290,27 @@ public class WechatMarkdownPublisher {
     /**
      * 创建草稿
      */
-    private String createDraft(String accessToken, String title, String content) throws IOException {
+    /**
+     * 创建草稿
+     */
+    private String createDraft(String accessToken, String title, String content, String thumbMediaId) throws IOException {
         String url = API_ADD_DRAFT + "?access_token=" + accessToken;
 
-        // 构建请求JSON
-        String json = String.format("""
-                {
-                  "articles": [
-                    {
-                      "title": "%s",
-                      "content": "%s"
-                    }
-                  ]
-                }
-                """, escapeJson(title), escapeJson(content));
+        // 使用ObjectMapper构建JSON，更可靠
+        ObjectNode article = objectMapper.createObjectNode();
+        article.put("title", title);
+        article.put("content", content);
+        if (thumbMediaId != null) {
+            article.put("thumb_media_id", thumbMediaId);
+        }
+
+        ArrayNode articles = objectMapper.createArrayNode();
+        articles.add(article);
+
+        ObjectNode root = objectMapper.createObjectNode();
+        root.set("articles", articles);
+
+        String json = objectMapper.writeValueAsString(root);
 
         RequestBody requestBody = RequestBody.create(json, MediaType.parse("application/json"));
         Request request = new Request.Builder()
@@ -276,14 +335,24 @@ public class WechatMarkdownPublisher {
     }
 
     /**
-     * 转义JSON中的特殊字符
+     * 图片上传结果（包含处理后的markdown和封面mediaId）
      */
-    private String escapeJson(String s) {
-        return s.replace("\\", "\\\\")
-                .replace("\"", "\\\"")
-                .replace("\n", "\\n")
-                .replace("\r", "\\r")
-                .replace("\t", "\\t");
+    public static class ImageUploadResult {
+        private final String processedMarkdown;
+        private final String thumbMediaId;
+
+        public ImageUploadResult(String processedMarkdown, String thumbMediaId) {
+            this.processedMarkdown = processedMarkdown;
+            this.thumbMediaId = thumbMediaId;
+        }
+
+        public String getProcessedMarkdown() {
+            return processedMarkdown;
+        }
+
+        public String getThumbMediaId() {
+            return thumbMediaId;
+        }
     }
 
     /**
